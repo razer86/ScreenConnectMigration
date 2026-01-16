@@ -1,0 +1,16 @@
+# Configuration file with secrets
+config.ps1
+
+# Log data
+Data/
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
