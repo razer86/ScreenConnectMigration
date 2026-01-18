@@ -19,14 +19,14 @@ Device connects to source ScreenConnect
          ↓
 Automation sends session data (webhook) to this receiver
          ↓
-Receiver validates source IP, builds installer URL for target instance
+Receiver identifies instance from URL path, validates payload
          ↓
 Pushes install command back to device via RESTful API
          ↓
 Device installs target agent with same name and custom properties
 ```
 
-Authentication works by validating the source IP of incoming webhooks against your configured ScreenConnect server IPs.
+Each source instance gets its own endpoint (e.g., `/api/v1/sc/intake/instance1`), so you configure the webhook URL in ScreenConnect to identify which instance it's coming from.
 
 ## Requirements
 
@@ -71,15 +71,14 @@ Configuration:
 
 ```powershell
 @{
-    ListenPrefix  = "http://+:38080/"
-    IntakePath    = "/api/v1/sc/intake"
-    DataDir       = "C:\SCMigrate\Data"
-    TestMode      = $true
-    TargetBaseUrl = "https://target.screenconnect.com"
+    ListenPrefix   = "http://+:38080/"
+    IntakeBasePath = "/api/v1/sc/intake"  # Endpoints: /api/v1/sc/intake/{instance}
+    DataDir        = "C:\SCMigrate\Data"
+    TestMode       = $true
+    TargetBaseUrl  = "https://target.screenconnect.com"
 
     SourceInstances = @{
-        "51.161.218.179" = @{
-            Instance   = "source1"
+        "source1" = @{
             BaseUrl    = "https://source1.screenconnect.com"
             ExtGuid    = "2d558935-686a-4bd0-9991-07539f5fe749"
             CtrlSecret = "your-RESTfulAuthenticationSecret-value"
@@ -87,9 +86,6 @@ Configuration:
     }
 }
 ```
-
-To find your ScreenConnect server's public IP:
-For Cloud Hosted this is available at **Admin > Overview > Browser URL Check**
 
 ### 3. Create ScreenConnect Automation
 
@@ -106,7 +102,7 @@ On each source instance, create an automation:
 
 **Action:**
 - Type: `HTTP Request`
-- URL: `http://YOUR_SERVER_IP:38080/api/v1/sc/intake`
+- URL: `http://YOUR_SERVER_IP:38080/api/v1/sc/intake/source1`  ← Use your instance name
 - HTTP Method: `POST`
 - Content Type: `application/json`
 - Body: `{Session:json}`
@@ -115,6 +111,21 @@ On each source instance, create an automation:
 
 ```powershell
 .\Migrate-ScreenConnect.ps1
+```
+
+On startup you'll see the configured endpoints:
+
+```
+========================================
+ ScreenConnect Migration Receiver
+========================================
+Listening: http://+:38080/
+Base Path: /api/v1/sc/intake/{instance}
+Target:    https://target.screenconnect.com
+Instances:
+  - /api/v1/sc/intake/source1
+  - /api/v1/sc/intake/source2
+----------------------------------------
 ```
 
 ## Usage
@@ -162,8 +173,9 @@ Events are logged to `{DataDir}/migration.log` as JSON lines:
 
 ## Troubleshooting
 
-**"Unknown source IP" error**
-- Verify the IP in config matches your ScreenConnect server. Cloud instances may resolve to unexpected IPs.
+**"Unknown instance" error**
+- Check the URL path matches an instance key in your config (case-insensitive)
+- Verify the automation URL includes the instance name: `/api/v1/sc/intake/yourinstance`
 
 **Commands not executing on devices**
 - Check that RESTful API Manager is installed and enabled
@@ -176,7 +188,7 @@ Events are logged to `{DataDir}/migration.log` as JSON lines:
 
 ## Security
 
-- Requests are validated by source IP
+- Each instance has its own endpoint, reducing misconfiguration risk
 - API secrets stay on the server, never sent in requests
 - Consider using a reverse proxy with HTTPS for production
 

@@ -32,7 +32,7 @@ if (-not (Test-Path $ConfigPath)) {
 $Config = & $ConfigPath
 
 # Validate required config
-$requiredKeys = @("ListenPrefix", "IntakePath", "DataDir", "TargetBaseUrl", "SourceInstances")
+$requiredKeys = @("ListenPrefix", "IntakeBasePath", "DataDir", "TargetBaseUrl", "SourceInstances")
 foreach ($key in $requiredKeys) {
     if (-not $Config.ContainsKey($key)) {
         Write-Host "Missing required config key: $key" -ForegroundColor Red
@@ -47,17 +47,41 @@ if ($Config.SourceInstances.Count -eq 0) {
 
 # Extract config values
 $ListenPrefix    = $Config.ListenPrefix
-$IntakePath      = $Config.IntakePath
+$IntakeBasePath  = $Config.IntakeBasePath.TrimEnd('/')
 $DataDir         = $Config.DataDir
 $TestMode        = $Config.TestMode -eq $true
 $TargetBaseUrl   = $Config.TargetBaseUrl.TrimEnd('/')
-$ScConfigByIP    = $Config.SourceInstances
+$SourceInstances = $Config.SourceInstances
 
 # Ensure data directory exists
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 $LogFile = Join-Path $DataDir "migration.log"
+$ErrorLogFile = Join-Path $DataDir "errors.log"
 
 #region Functions
+
+function Write-ErrorLog {
+    param(
+        [string]$Instance,
+        [string]$Reason,
+        [string]$SourceIP,
+        [string]$Path,
+        [string]$SessionId,
+        [string]$RawBody
+    )
+
+    $entry = [ordered]@{
+        ts        = (Get-Date).ToString("o")
+        instance  = $Instance
+        reason    = $Reason
+        sourceIP  = $SourceIP
+        path      = $Path
+        sessionId = $SessionId
+        rawBody   = if ($RawBody.Length -gt 1000) { $RawBody.Substring(0, 1000) + "..." } else { $RawBody }
+    } | ConvertTo-Json -Depth 10 -Compress
+
+    Add-Content -Path $ErrorLogFile -Value $entry
+}
 
 function Sc-GetDetails([string]$scBase, [hashtable]$scHeaders, [string]$SessionId) {
     $body = "[`"$SessionId`"]"
@@ -79,17 +103,35 @@ function Sc-SendCommand([string]$scBase, [hashtable]$scHeaders, [string]$Session
 }
 
 function Read-Body([System.Net.HttpListenerRequest]$req) {
-    if ($req.ContentLength64 -gt 1048576) { throw "Body too large" }
+    if ($req.ContentLength64 -gt 1048576) { throw "Body too large (max 1MB)" }
     $sr = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
     $body = $sr.ReadToEnd()
     $sr.Close()
     return $body
 }
 
-function Is-ValidPayload($p) {
-    if (-not ($p.PSObject.Properties.Name -contains "SessionID")) { return $false }
-    if ([string]::IsNullOrWhiteSpace([string]$p.SessionID)) { return $false }
-    return $true
+function Test-PayloadValid {
+    param($Payload, [ref]$MissingFields)
+
+    $required = @("SessionID", "Name", "SessionType")
+    $missing = @()
+
+    foreach ($field in $required) {
+        if (-not ($Payload.PSObject.Properties.Name -contains $field)) {
+            $missing += "$field (missing)"
+        }
+        elseif ([string]::IsNullOrWhiteSpace([string]$Payload.$field)) {
+            $missing += "$field (empty)"
+        }
+    }
+
+    # SessionType must be "Access" for migration candidates
+    if ($missing.Count -eq 0 -and [string]$Payload.SessionType -ne "Access") {
+        $missing += "SessionType (must be 'Access', got '$($Payload.SessionType)')"
+    }
+
+    $MissingFields.Value = $missing
+    return ($missing.Count -eq 0)
 }
 
 function Build-InstallerUrl([string]$baseUrl, [string]$name, [string[]]$customProperties) {
@@ -99,6 +141,19 @@ function Build-InstallerUrl([string]$baseUrl, [string]$name, [string[]]$customPr
         $url += "&c=$([uri]::EscapeDataString($cp))"
     }
     return $url
+}
+
+function Get-InstanceFromPath([string]$path, [string]$basePath) {
+    # Extract instance name from path like /api/v1/sc/intake/capconn -> capconn
+    if ($path.StartsWith($basePath + "/")) {
+        $remainder = $path.Substring($basePath.Length + 1)
+        # Take only the first segment (in case there's more path after)
+        $instance = $remainder.Split('/')[0]
+        if (-not [string]::IsNullOrWhiteSpace($instance)) {
+            return $instance.ToLower()
+        }
+    }
+    return $null
 }
 
 #endregion
@@ -111,12 +166,16 @@ $listener.Start()
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " ScreenConnect Migration Receiver" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Listening: $ListenPrefix"
-Write-Host "Endpoint:  $IntakePath"
-Write-Host "Target:    $TargetBaseUrl"
-Write-Host "Log:       $LogFile"
-Write-Host "Test Mode: $TestMode"
-Write-Host "Sources:   $($ScConfigByIP.Keys -join ', ')"
+Write-Host "Listening:  $ListenPrefix"
+Write-Host "Base Path:  $IntakeBasePath/{instance}"
+Write-Host "Target:     $TargetBaseUrl"
+Write-Host "Log:        $LogFile"
+Write-Host "Error Log:  $ErrorLogFile"
+Write-Host "Test Mode:  $TestMode"
+Write-Host "Instances:"
+foreach ($inst in $SourceInstances.Keys) {
+    Write-Host "  - $IntakeBasePath/$inst"
+}
 Write-Host "----------------------------------------"
 Write-Host "Press Ctrl+C to stop"
 Write-Host ""
@@ -130,30 +189,62 @@ try {
         $status = 200
         $outObj = @{ ok = $true }
 
-        try {
-            $raw = Read-Body $req
+        # Capture request info for error logging
+        $sourceIP = $req.RemoteEndPoint.Address.ToString()
+        $requestPath = $req.Url.AbsolutePath
+        $raw = ""
+        $instanceKey = $null
+        $sessionId = $null
 
-            # Validate source IP
-            $sourceIP = $req.RemoteEndPoint.Address.ToString()
-            if (-not $ScConfigByIP.ContainsKey($sourceIP)) {
-                $status = 403
-                throw "Rejected: Unknown source IP '$sourceIP'"
+        try {
+            # Method check first
+            if ($req.HttpMethod -ne "POST") {
+                $status = 405
+                throw "Method not allowed: $($req.HttpMethod)"
             }
 
-            # Get config for this source instance
-            $cfg = $ScConfigByIP[$sourceIP]
-            $instanceKey = $cfg.Instance
+            # Extract instance from URL path
+            $instanceKey = Get-InstanceFromPath $requestPath $IntakeBasePath
 
-            # Route validation
-            if ($req.HttpMethod -ne "POST") { $status = 405; throw "Method not allowed" }
-            if ($req.Url.AbsolutePath -ne $IntakePath) { $status = 404; throw "Not found" }
-            if ([string]::IsNullOrWhiteSpace($raw)) { $status = 400; throw "Empty body" }
+            if (-not $instanceKey) {
+                $status = 404
+                throw "Invalid path (expected $IntakeBasePath/{instance})"
+            }
 
-            $payload = $raw | ConvertFrom-Json -ErrorAction Stop
-            if (-not (Is-ValidPayload $payload)) { $status = 400; throw "Missing required field: SessionID" }
+            # Check if instance exists in config
+            if (-not $SourceInstances.ContainsKey($instanceKey)) {
+                $status = 404
+                throw "Unknown instance: $instanceKey"
+            }
+
+            $cfg = $SourceInstances[$instanceKey]
+
+            # Read body
+            $raw = Read-Body $req
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+                $status = 400
+                throw "Empty request body"
+            }
+
+            # Parse JSON
+            try {
+                $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+            }
+            catch {
+                $status = 400
+                throw "Invalid JSON: $($_.Exception.Message)"
+            }
+
+            # Validate required fields
+            $missingFields = @()
+            if (-not (Test-PayloadValid $payload ([ref]$missingFields))) {
+                $status = 400
+                throw "Missing required fields: $($missingFields -join ', ')"
+            }
+
+            $sessionId = [string]$payload.SessionID
 
             # Extract session data
-            $sessionId   = [string]$payload.SessionID
             $sessionName = [string]$payload.Name
             $cp = @(
                 [string]$payload.CustomProperty1,
@@ -226,6 +317,9 @@ Write-Host "Migration complete"
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ERROR | $errMsg" -ForegroundColor Red
             $outObj = @{ ok = $false; error = $errMsg }
             if ($status -eq 200) { $status = 500 }
+
+            # Log to error file
+            Write-ErrorLog -Instance $instanceKey -Reason $errMsg -SourceIP $sourceIP -Path $requestPath -SessionId $sessionId -RawBody $raw
         }
 
         # Send response
