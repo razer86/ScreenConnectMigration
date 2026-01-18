@@ -23,7 +23,9 @@ Receiver identifies instance from URL path, validates payload
          ↓
 Pushes install command back to device via RESTful API
          ↓
-Device installs target agent with same name and custom properties
+Device installs target agent, reports success/failure back
+         ↓
+Receiver updates CustomProperty8 with final status
 ```
 
 Each source instance gets its own endpoint (e.g., `/api/v1/sc/intake/instance1`), so you configure the webhook URL in ScreenConnect to identify which instance it's coming from.
@@ -32,7 +34,7 @@ Each source instance gets its own endpoint (e.g., `/api/v1/sc/intake/instance1`)
 
 **Server (where this script runs):**
 - Windows with PowerShell 5.1+
-- Port accessible from your ScreenConnect instance(s)
+- Port accessible from your ScreenConnect instance(s) AND from devices being migrated
 
 **Source ScreenConnect instance(s):**
 - RESTful API Manager extension installed
@@ -71,11 +73,13 @@ Configuration:
 
 ```powershell
 @{
-    ListenPrefix   = "http://+:38080/"
-    IntakeBasePath = "/api/v1/sc/intake"  # Endpoints: /api/v1/sc/intake/{instance}
-    DataDir        = "C:\SCMigrate\Data"
-    TestMode       = $true
-    TargetBaseUrl  = "https://target.screenconnect.com"
+    ListenPrefix    = "http://+:38080/"
+    IntakeBasePath  = "/api/v1/sc/intake"   # Intake: /api/v1/sc/intake/{instance}
+    ResultBasePath  = "/api/v1/sc/result"   # Result: /api/v1/sc/result/{instance}
+    DataDir         = "C:\SCMigrate\Data"
+    CallbackBaseUrl = "http://YOUR_PUBLIC_IP:38080"  # Devices call back here
+    TestMode        = $true
+    TargetBaseUrl   = "https://target.screenconnect.com"
 
     SourceInstances = @{
         "source1" = @{
@@ -86,6 +90,8 @@ Configuration:
     }
 }
 ```
+
+**Important:** `CallbackBaseUrl` must be reachable from the devices being migrated. This is the URL devices use to report installation success/failure.
 
 ### 3. Create ScreenConnect Automation
 
@@ -119,12 +125,19 @@ On startup you'll see the configured endpoints:
 ========================================
  ScreenConnect Migration Receiver
 ========================================
-Listening: http://+:38080/
-Base Path: /api/v1/sc/intake/{instance}
-Target:    https://target.screenconnect.com
-Instances:
-  - /api/v1/sc/intake/source1
-  - /api/v1/sc/intake/source2
+Listening:   http://+:38080/
+Callback:    http://111.220.28.125:38080
+Target:      https://target.screenconnect.com
+Test Mode:   False
+
+Endpoints:
+  Intake: /api/v1/sc/intake/source1
+  Result: /api/v1/sc/result/source1
+
+Logs:
+  Migration: C:\SCMigrate\Data\migration.log
+  Results:   C:\SCMigrate\Data\results.log
+  Errors:    C:\SCMigrate\Data\errors.log
 ----------------------------------------
 ```
 
@@ -141,12 +154,29 @@ With `TestMode = $true`, the receiver logs incoming webhooks but doesn't send co
 ### Production Mode
 
 With `TestMode = $false`, the receiver:
-- Updates CustomProperty8 on the source to `MIG:SENT:timestamp`
-- Sends the install command to the device
+
+1. Updates CustomProperty8 to `MIG:SENT:timestamp`
+2. Sends install command to device
+3. Device downloads and runs installer
+4. Device reports result back to receiver
+5. Receiver updates CustomProperty8 to final status
 
 ```
-[23:41:51] SENT | source1 | LAPTOP001 | abc123-def456 | CP1=Acme Corp
+[23:41:51] SENT    | source1 | LAPTOP001 | abc123-def456 | CP1=Acme Corp
+[23:42:15] SUCCESS | source1 | abc123-def456
 ```
+
+### Migration Status (CustomProperty8)
+
+The receiver tracks migration progress in CustomProperty8:
+
+| Status | Meaning |
+|--------|---------|
+| `MIG:SENT` | Install command sent, waiting for result |
+| `MIG:SUCCESS` | Installation completed successfully |
+| `MIG:FAILED` | Installation failed (check results.log for details) |
+
+These values work well for ScreenConnect Session Groups to organize devices by migration status.
 
 ### Filtering Devices
 
@@ -165,10 +195,18 @@ Session.CustomProperty8 NOT LIKE 'MIG:%'
 
 ## Logs
 
-Events are logged to `{DataDir}/migration.log` as JSON lines:
+Three log files are maintained in the data directory:
+
+| File | Contents |
+|------|----------|
+| `migration.log` | All intake requests (successful migrations initiated) |
+| `results.log` | Device callback results (success/failure) |
+| `errors.log` | Failed requests (validation errors, unknown instances, etc.) |
+
+All logs are JSON lines format:
 
 ```json
-{"ts":"2024-01-15T23:41:51.378+10:00","instance":"source1","sessionId":"abc123","sessionName":"LAPTOP001","cp1":"Acme Corp",...}
+{"ts":"2024-01-15T23:41:51.378+10:00","instance":"source1","sessionId":"abc123","success":true,"message":"Installation completed successfully"}
 ```
 
 ## Troubleshooting
@@ -186,10 +224,16 @@ Events are logged to `{DataDir}/migration.log` as JSON lines:
 - Ensure devices can reach the target ScreenConnect URL
 - Older machines may need TLS 1.2 enabled
 
+**No callback received (stuck at MIG:SENT)**
+- Verify `CallbackBaseUrl` is reachable from the device's network
+- Check firewall rules allow inbound connections on your port
+- Review the ScreenConnect command output for errors
+
 ## Security
 
 - Each instance has its own endpoint, reducing misconfiguration risk
 - API secrets stay on the server, never sent in requests
+- Payload validation ensures only valid ScreenConnect session data is processed
 - Consider using a reverse proxy with HTTPS for production
 
 ## License

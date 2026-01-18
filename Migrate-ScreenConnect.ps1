@@ -32,7 +32,7 @@ if (-not (Test-Path $ConfigPath)) {
 $Config = & $ConfigPath
 
 # Validate required config
-$requiredKeys = @("ListenPrefix", "IntakeBasePath", "DataDir", "TargetBaseUrl", "SourceInstances")
+$requiredKeys = @("ListenPrefix", "IntakeBasePath", "ResultBasePath", "CallbackBaseUrl", "DataDir", "TargetBaseUrl", "SourceInstances")
 foreach ($key in $requiredKeys) {
     if (-not $Config.ContainsKey($key)) {
         Write-Host "Missing required config key: $key" -ForegroundColor Red
@@ -48,6 +48,8 @@ if ($Config.SourceInstances.Count -eq 0) {
 # Extract config values
 $ListenPrefix    = $Config.ListenPrefix
 $IntakeBasePath  = $Config.IntakeBasePath.TrimEnd('/')
+$ResultBasePath  = $Config.ResultBasePath.TrimEnd('/')
+$CallbackBaseUrl = $Config.CallbackBaseUrl.TrimEnd('/')
 $DataDir         = $Config.DataDir
 $TestMode        = $Config.TestMode -eq $true
 $TargetBaseUrl   = $Config.TargetBaseUrl.TrimEnd('/')
@@ -56,6 +58,7 @@ $SourceInstances = $Config.SourceInstances
 # Ensure data directory exists
 New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 $LogFile = Join-Path $DataDir "migration.log"
+$ResultLogFile = Join-Path $DataDir "results.log"
 $ErrorLogFile = Join-Path $DataDir "errors.log"
 
 #region Functions
@@ -81,6 +84,27 @@ function Write-ErrorLog {
     } | ConvertTo-Json -Depth 10 -Compress
 
     Add-Content -Path $ErrorLogFile -Value $entry
+}
+
+function Write-ResultLog {
+    param(
+        [string]$Instance,
+        [string]$SessionId,
+        [bool]$Success,
+        [string]$Message,
+        [string]$SourceIP
+    )
+
+    $entry = [ordered]@{
+        ts        = (Get-Date).ToString("o")
+        instance  = $Instance
+        sessionId = $SessionId
+        success   = $Success
+        message   = $Message
+        sourceIP  = $SourceIP
+    } | ConvertTo-Json -Depth 10 -Compress
+
+    Add-Content -Path $ResultLogFile -Value $entry
 }
 
 function Sc-GetDetails([string]$scBase, [hashtable]$scHeaders, [string]$SessionId) {
@@ -134,6 +158,27 @@ function Test-PayloadValid {
     return ($missing.Count -eq 0)
 }
 
+function Test-ResultPayloadValid {
+    param($Payload, [ref]$MissingFields)
+
+    $required = @("sessionId", "success")
+    $missing = @()
+
+    foreach ($field in $required) {
+        if (-not ($Payload.PSObject.Properties.Name -contains $field)) {
+            $missing += "$field (missing)"
+        }
+    }
+
+    # sessionId must be non-empty
+    if ($Payload.PSObject.Properties.Name -contains "sessionId" -and [string]::IsNullOrWhiteSpace([string]$Payload.sessionId)) {
+        $missing += "sessionId (empty)"
+    }
+
+    $MissingFields.Value = $missing
+    return ($missing.Count -eq 0)
+}
+
 function Build-InstallerUrl([string]$baseUrl, [string]$name, [string[]]$customProperties) {
     $url = "$baseUrl/Bin/ScreenConnect.ClientSetup.exe?e=Access&y=Guest"
     $url += "&t=$([uri]::EscapeDataString($name))"
@@ -156,6 +201,17 @@ function Get-InstanceFromPath([string]$path, [string]$basePath) {
     return $null
 }
 
+function Get-RouteType([string]$path) {
+    # Determine if this is an intake or result request
+    if ($path.StartsWith($IntakeBasePath + "/")) {
+        return "intake"
+    }
+    elseif ($path.StartsWith($ResultBasePath + "/")) {
+        return "result"
+    }
+    return $null
+}
+
 #endregion
 
 # Start listener
@@ -166,16 +222,21 @@ $listener.Start()
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " ScreenConnect Migration Receiver" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "Listening:  $ListenPrefix"
-Write-Host "Base Path:  $IntakeBasePath/{instance}"
-Write-Host "Target:     $TargetBaseUrl"
-Write-Host "Log:        $LogFile"
-Write-Host "Error Log:  $ErrorLogFile"
-Write-Host "Test Mode:  $TestMode"
-Write-Host "Instances:"
+Write-Host "Listening:   $ListenPrefix"
+Write-Host "Callback:    $CallbackBaseUrl"
+Write-Host "Target:      $TargetBaseUrl"
+Write-Host "Test Mode:   $TestMode"
+Write-Host ""
+Write-Host "Endpoints:"
 foreach ($inst in $SourceInstances.Keys) {
-    Write-Host "  - $IntakeBasePath/$inst"
+    Write-Host "  Intake: $IntakeBasePath/$inst"
+    Write-Host "  Result: $ResultBasePath/$inst"
 }
+Write-Host ""
+Write-Host "Logs:"
+Write-Host "  Migration: $LogFile"
+Write-Host "  Results:   $ResultLogFile"
+Write-Host "  Errors:    $ErrorLogFile"
 Write-Host "----------------------------------------"
 Write-Host "Press Ctrl+C to stop"
 Write-Host ""
@@ -203,113 +264,223 @@ try {
                 throw "Method not allowed: $($req.HttpMethod)"
             }
 
-            # Extract instance from URL path
-            $instanceKey = Get-InstanceFromPath $requestPath $IntakeBasePath
+            # Determine route type
+            $routeType = Get-RouteType $requestPath
 
-            if (-not $instanceKey) {
-                $status = 404
-                throw "Invalid path (expected $IntakeBasePath/{instance})"
+            if ($routeType -eq "intake") {
+                # === INTAKE ENDPOINT ===
+                $instanceKey = Get-InstanceFromPath $requestPath $IntakeBasePath
+
+                if (-not $instanceKey) {
+                    $status = 404
+                    throw "Invalid path (expected $IntakeBasePath/{instance})"
+                }
+
+                if (-not $SourceInstances.ContainsKey($instanceKey)) {
+                    $status = 404
+                    throw "Unknown instance: $instanceKey"
+                }
+
+                $cfg = $SourceInstances[$instanceKey]
+
+                # Read body
+                $raw = Read-Body $req
+                if ([string]::IsNullOrWhiteSpace($raw)) {
+                    $status = 400
+                    throw "Empty request body"
+                }
+
+                # Parse JSON
+                try {
+                    $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+                }
+                catch {
+                    $status = 400
+                    throw "Invalid JSON: $($_.Exception.Message)"
+                }
+
+                # Validate required fields
+                $missingFields = @()
+                if (-not (Test-PayloadValid $payload ([ref]$missingFields))) {
+                    $status = 400
+                    throw "Missing required fields: $($missingFields -join ', ')"
+                }
+
+                $sessionId = [string]$payload.SessionID
+
+                # Extract session data
+                $sessionName = [string]$payload.Name
+                $cp = @(
+                    [string]$payload.CustomProperty1,
+                    [string]$payload.CustomProperty2,
+                    [string]$payload.CustomProperty3,
+                    [string]$payload.CustomProperty4,
+                    [string]$payload.CustomProperty5,
+                    [string]$payload.CustomProperty6,
+                    [string]$payload.CustomProperty7,
+                    ""  # CP8 intentionally blank on new instance
+                )
+
+                # Build API config for source instance
+                $scUrl  = $cfg.BaseUrl.TrimEnd('/')
+                $scBase = "$scUrl/App_Extensions/$($cfg.ExtGuid)/Service.ashx"
+                $scHeaders = @{
+                    "CTRLAuthHeader" = $cfg.CtrlSecret
+                    "Origin"         = $scUrl
+                }
+
+                # Build installer URL for target instance
+                $installerUrl = Build-InstallerUrl $TargetBaseUrl $sessionName $cp
+
+                # Build callback URL for result reporting
+                $resultUrl = "$CallbackBaseUrl$ResultBasePath/$instanceKey"
+
+                # Log the request
+                $ts = (Get-Date).ToString("o")
+                $logEntry = [ordered]@{
+                    ts = $ts
+                    instance = $instanceKey
+                    sessionId = $sessionId
+                    sessionName = $sessionName
+                    cp1 = $cp[0]; cp2 = $cp[1]; cp3 = $cp[2]; cp4 = $cp[3]
+                    cp5 = $cp[4]; cp6 = $cp[5]; cp7 = $cp[6]
+                    installerUrl = $installerUrl
+                    testMode = $TestMode
+                } | ConvertTo-Json -Depth 10 -Compress
+                Add-Content -Path $LogFile -Value $logEntry
+
+                # Process the migration
+                $timeShort = $ts.Substring(11, 8)
+                if ($TestMode) {
+                    Write-Host "[$timeShort] TEST | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Yellow
+                    $outObj = @{ ok = $true; action = "test_logged"; sessionId = $sessionId; instance = $instanceKey }
+                }
+                else {
+                    Write-Host "[$timeShort] SENT | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Green
+
+                    # Update CP8 on source to mark as migrating
+                    Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SENT"
+
+                    # Send install command to device with callback
+                    $cmd = @"
+#!ps
+#timeout=300000
+`$ErrorActionPreference = "Stop"
+`$sessionId = "$sessionId"
+`$installerUrl = "$installerUrl"
+`$resultUrl = "$resultUrl"
+`$installerPath = "`$env:TEMP\ScreenConnect.ClientSetup.exe"
+
+function Send-Result {
+    param([bool]`$Success, [string]`$Message)
+    try {
+        `$body = @{ sessionId = `$sessionId; success = `$Success; message = `$Message } | ConvertTo-Json -Compress
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-RestMethod -Uri `$resultUrl -Method POST -Body `$body -ContentType "application/json" -UseBasicParsing | Out-Null
+    } catch {
+        Write-Host "Failed to send result: `$(`$_.Exception.Message)"
+    }
+}
+
+try {
+    Write-Host "Downloading ScreenConnect installer..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri `$installerUrl -OutFile `$installerPath -UseBasicParsing
+
+    Write-Host "Running installer..."
+    `$process = Start-Process -FilePath `$installerPath -ArgumentList "/silent" -Wait -PassThru
+
+    Remove-Item -Path `$installerPath -Force -ErrorAction SilentlyContinue
+
+    if (`$process.ExitCode -eq 0) {
+        Write-Host "Migration complete"
+        Send-Result -Success `$true -Message "Installation completed successfully"
+    } else {
+        Write-Host "Installer exited with code: `$(`$process.ExitCode)"
+        Send-Result -Success `$false -Message "Installer exited with code: `$(`$process.ExitCode)"
+    }
+} catch {
+    `$errorMsg = `$_.Exception.Message
+    Write-Host "Migration failed: `$errorMsg"
+    Send-Result -Success `$false -Message `$errorMsg
+}
+"@
+                    Sc-SendCommand $scBase $scHeaders $sessionId $cmd
+                    $outObj = @{ ok = $true; action = "sent"; sessionId = $sessionId; instance = $instanceKey }
+                }
             }
+            elseif ($routeType -eq "result") {
+                # === RESULT ENDPOINT ===
+                $instanceKey = Get-InstanceFromPath $requestPath $ResultBasePath
 
-            # Check if instance exists in config
-            if (-not $SourceInstances.ContainsKey($instanceKey)) {
-                $status = 404
-                throw "Unknown instance: $instanceKey"
-            }
+                if (-not $instanceKey) {
+                    $status = 404
+                    throw "Invalid path (expected $ResultBasePath/{instance})"
+                }
 
-            $cfg = $SourceInstances[$instanceKey]
+                if (-not $SourceInstances.ContainsKey($instanceKey)) {
+                    $status = 404
+                    throw "Unknown instance: $instanceKey"
+                }
 
-            # Read body
-            $raw = Read-Body $req
-            if ([string]::IsNullOrWhiteSpace($raw)) {
-                $status = 400
-                throw "Empty request body"
-            }
+                $cfg = $SourceInstances[$instanceKey]
 
-            # Parse JSON
-            try {
-                $payload = $raw | ConvertFrom-Json -ErrorAction Stop
-            }
-            catch {
-                $status = 400
-                throw "Invalid JSON: $($_.Exception.Message)"
-            }
+                # Read body
+                $raw = Read-Body $req
+                if ([string]::IsNullOrWhiteSpace($raw)) {
+                    $status = 400
+                    throw "Empty request body"
+                }
 
-            # Validate required fields
-            $missingFields = @()
-            if (-not (Test-PayloadValid $payload ([ref]$missingFields))) {
-                $status = 400
-                throw "Missing required fields: $($missingFields -join ', ')"
-            }
+                # Parse JSON
+                try {
+                    $payload = $raw | ConvertFrom-Json -ErrorAction Stop
+                }
+                catch {
+                    $status = 400
+                    throw "Invalid JSON: $($_.Exception.Message)"
+                }
 
-            $sessionId = [string]$payload.SessionID
+                # Validate required fields
+                $missingFields = @()
+                if (-not (Test-ResultPayloadValid $payload ([ref]$missingFields))) {
+                    $status = 400
+                    throw "Missing required fields: $($missingFields -join ', ')"
+                }
 
-            # Extract session data
-            $sessionName = [string]$payload.Name
-            $cp = @(
-                [string]$payload.CustomProperty1,
-                [string]$payload.CustomProperty2,
-                [string]$payload.CustomProperty3,
-                [string]$payload.CustomProperty4,
-                [string]$payload.CustomProperty5,
-                [string]$payload.CustomProperty6,
-                [string]$payload.CustomProperty7,
-                ""  # CP8 intentionally blank on new instance
-            )
+                $sessionId = [string]$payload.sessionId
+                $success = [bool]$payload.success
+                $message = if ($payload.PSObject.Properties.Name -contains "message") { [string]$payload.message } else { "" }
 
-            # Build API config for source instance
-            $scUrl  = $cfg.BaseUrl.TrimEnd('/')
-            $scBase = "$scUrl/App_Extensions/$($cfg.ExtGuid)/Service.ashx"
-            $scHeaders = @{
-                "CTRLAuthHeader" = $cfg.CtrlSecret
-                "Origin"         = $scUrl
-            }
+                # Build API config for source instance
+                $scUrl  = $cfg.BaseUrl.TrimEnd('/')
+                $scBase = "$scUrl/App_Extensions/$($cfg.ExtGuid)/Service.ashx"
+                $scHeaders = @{
+                    "CTRLAuthHeader" = $cfg.CtrlSecret
+                    "Origin"         = $scUrl
+                }
 
-            # Build installer URL for target instance
-            $installerUrl = Build-InstallerUrl $TargetBaseUrl $sessionName $cp
+                # Update CP8 based on result
+                $ts = (Get-Date).ToString("o")
+                $timeShort = $ts.Substring(11, 8)
 
-            # Log the request
-            $ts = (Get-Date).ToString("o")
-            $logEntry = [ordered]@{
-                ts = $ts
-                instance = $instanceKey
-                sessionId = $sessionId
-                sessionName = $sessionName
-                cp1 = $cp[0]; cp2 = $cp[1]; cp3 = $cp[2]; cp4 = $cp[3]
-                cp5 = $cp[4]; cp6 = $cp[5]; cp7 = $cp[6]
-                installerUrl = $installerUrl
-                testMode = $TestMode
-            } | ConvertTo-Json -Depth 10 -Compress
-            Add-Content -Path $LogFile -Value $logEntry
+                if ($success) {
+                    Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SUCCESS"
+                    Write-Host "[$timeShort] SUCCESS | $instanceKey | $sessionId" -ForegroundColor Green
+                }
+                else {
+                    Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:FAILED"
+                    Write-Host "[$timeShort] FAILED  | $instanceKey | $sessionId | $message" -ForegroundColor Red
+                }
 
-            # Process the migration
-            $timeShort = $ts.Substring(11, 8)
-            if ($TestMode) {
-                Write-Host "[$timeShort] TEST | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Yellow
-                $outObj = @{ ok = $true; action = "test_logged"; sessionId = $sessionId; instance = $instanceKey }
+                # Log the result
+                Write-ResultLog -Instance $instanceKey -SessionId $sessionId -Success $success -Message $message -SourceIP $sourceIP
+
+                $outObj = @{ ok = $true; action = "result_recorded"; sessionId = $sessionId; success = $success }
             }
             else {
-                Write-Host "[$timeShort] SENT | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Green
-
-                # Update CP8 on source to mark as migrating
-                Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SENT:$(Get-Date -Format 'yyyyMMddHHmmss')"
-
-                # Send install command to device
-                $cmd = @"
-#!ps #timeout=300000
-`$ErrorActionPreference = "Stop"
-`$installerUrl = "$installerUrl"
-`$installerPath = "`$env:TEMP\ScreenConnect.ClientSetup.exe"
-Write-Host "Downloading ScreenConnect installer..."
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri `$installerUrl -OutFile `$installerPath -UseBasicParsing
-Write-Host "Running installer..."
-Start-Process -FilePath `$installerPath -ArgumentList "/silent" -Wait
-Remove-Item -Path `$installerPath -Force -ErrorAction SilentlyContinue
-Write-Host "Migration complete"
-"@
-                Sc-SendCommand $scBase $scHeaders $sessionId $cmd
-                $outObj = @{ ok = $true; action = "sent"; sessionId = $sessionId; instance = $instanceKey }
+                $status = 404
+                throw "Unknown endpoint: $requestPath"
             }
         }
         catch {

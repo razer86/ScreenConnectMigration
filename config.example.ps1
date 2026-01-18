@@ -5,8 +5,13 @@
 @{
     # HTTP listener settings
     ListenPrefix   = "http://+:38080/"
-    IntakeBasePath = "/api/v1/sc/intake"  # Endpoints will be /api/v1/sc/intake/{instance}
+    IntakeBasePath = "/api/v1/sc/intake"   # Intake endpoints: /api/v1/sc/intake/{instance}
+    ResultBasePath = "/api/v1/sc/result"   # Result endpoints: /api/v1/sc/result/{instance}
     DataDir        = "C:\SCMigrate\Data"
+
+    # Public URL for this receiver (devices will call back to report install results)
+    # This must be reachable from the devices being migrated
+    CallbackBaseUrl = "http://YOUR_PUBLIC_IP:38080"
 
     # Test mode: $true = log only, $false = send commands to devices
     TestMode = $true
