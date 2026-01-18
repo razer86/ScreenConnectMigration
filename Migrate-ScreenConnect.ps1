@@ -352,11 +352,13 @@ try {
                 # Process the migration
                 $timeShort = $ts.Substring(11, 8)
                 if ($TestMode) {
-                    Write-Host "[$timeShort] TEST | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Yellow
+                    $line = "[$timeShort] " + "TEST".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    Write-Host $line -ForegroundColor Yellow
                     $outObj = @{ ok = $true; action = "test_logged"; sessionId = $sessionId; instance = $instanceKey }
                 }
                 else {
-                    Write-Host "[$timeShort] SENT | $instanceKey | $sessionName | $sessionId | CP1=$($cp[0])" -ForegroundColor Green
+                    $line = "[$timeShort] " + "SENT".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    Write-Host $line -ForegroundColor Blue
 
                     # Update CP8 on source to mark as migrating
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SENT"
@@ -364,7 +366,7 @@ try {
                     # Send install command to device with callback
                     $cmd = @"
 #!ps
-#timeout=300000
+#timeout=900000
 `$ErrorActionPreference = "Stop"
 `$sessionId = "$sessionId"
 `$installerUrl = "$installerUrl"
@@ -460,17 +462,24 @@ try {
                     "Origin"         = $scUrl
                 }
 
+                # Get session details for console output
+                $details = Sc-GetDetails $scBase $scHeaders $sessionId
+                $sessionName = $details.Session.Name
+                $cp1 = $details.Session.CustomPropertyValues[0]
+
                 # Update CP8 based on result
                 $ts = (Get-Date).ToString("o")
                 $timeShort = $ts.Substring(11, 8)
 
                 if ($success) {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SUCCESS"
-                    Write-Host "[$timeShort] SUCCESS | $instanceKey | $sessionId" -ForegroundColor Green
+                    $line = "[$timeShort] " + "SUCCESS".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    Write-Host $line -ForegroundColor Green
                 }
                 else {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:FAILED"
-                    Write-Host "[$timeShort] FAILED  | $instanceKey | $sessionId | $message" -ForegroundColor Red
+                    $line = "[$timeShort] " + "FAILED".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    Write-Host $line -ForegroundColor Red
                 }
 
                 # Log the result
@@ -485,7 +494,8 @@ try {
         }
         catch {
             $errMsg = $_.Exception.Message
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ERROR | $errMsg" -ForegroundColor Red
+            $line = "[$(Get-Date -Format 'HH:mm:ss')] " + "ERROR".PadRight(8) + "| " + $errMsg
+            Write-Host $line -ForegroundColor Red
             $outObj = @{ ok = $false; error = $errMsg }
             if ($status -eq 200) { $status = 500 }
 
