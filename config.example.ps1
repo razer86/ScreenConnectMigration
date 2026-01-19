@@ -19,16 +19,22 @@
     # Target ScreenConnect instance (where devices will be migrated TO)
     TargetBaseUrl = "https://new-instance.screenconnect.com"
 
-    # Source instances - keyed by instance name (used in URL path)
-    # Each instance gets its own endpoint: /api/v1/sc/intake/{instance}
+    # Target instance RESTful API settings (required for Compare-Devices.ps1)
+    # Install RESTful API Manager on target instance and configure these values
+    TargetExtGuid    = "2d558935-686a-4bd0-9991-07539f5fe749"  # RESTful API Manager extension GUID
+    TargetCtrlSecret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # RESTfulAuthenticationSecret value
+
+    # Source instances - keyed by branch code (used in URL path and CP5)
+    # Each instance gets its own endpoint: /api/v1/sc/intake/{BRANCH}
     # Configure your ScreenConnect automation to POST to that URL
+    # The branch code is also used in CP5 to identify the source instance
     SourceInstances = @{
-        # "instance1" = @{
+        # "BRANCH1" = @{
         #     BaseUrl    = "https://instance1.screenconnect.com"
         #     ExtGuid    = "2d558935-686a-4bd0-9991-07539f5fe749"  # RESTful API Manager extension GUID
         #     CtrlSecret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"  # RESTfulAuthenticationSecret value
         # }
-        # "instance2" = @{
+        # "BRANCH2" = @{
         #     BaseUrl    = "https://instance2.screenconnect.com"
         #     ExtGuid    = "2d558935-686a-4bd0-9991-07539f5fe749"
         #     CtrlSecret = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"

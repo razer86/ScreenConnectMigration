@@ -189,13 +189,13 @@ function Build-InstallerUrl([string]$baseUrl, [string]$name, [string[]]$customPr
 }
 
 function Get-InstanceFromPath([string]$path, [string]$basePath) {
-    # Extract instance name from path like /api/v1/sc/intake/capconn -> capconn
+    # Extract instance name from path like /api/v1/sc/intake/CAPC -> CAPC
     if ($path.StartsWith($basePath + "/")) {
         $remainder = $path.Substring($basePath.Length + 1)
         # Take only the first segment (in case there's more path after)
         $instance = $remainder.Split('/')[0]
         if (-not [string]::IsNullOrWhiteSpace($instance)) {
-            return $instance.ToLower()
+            return $instance.ToUpper()
         }
     }
     return $null
@@ -352,12 +352,12 @@ try {
                 # Process the migration
                 $timeShort = $ts.Substring(11, 8)
                 if ($TestMode) {
-                    $line = "[$timeShort] " + "TEST".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    $line = "[$timeShort] " + "TEST".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
                     Write-Host $line -ForegroundColor Yellow
                     $outObj = @{ ok = $true; action = "test_logged"; sessionId = $sessionId; instance = $instanceKey }
                 }
                 else {
-                    $line = "[$timeShort] " + "SENT".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    $line = "[$timeShort] " + "SENT".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
                     Write-Host $line -ForegroundColor Blue
 
                     # Update CP8 on source to mark as migrating
@@ -473,12 +473,12 @@ try {
 
                 if ($success) {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SUCCESS"
-                    $line = "[$timeShort] " + "SUCCESS".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    $line = "[$timeShort] " + "SUCCESS".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
                     Write-Host $line -ForegroundColor Green
                 }
                 else {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:FAILED"
-                    $line = "[$timeShort] " + "FAILED".PadRight(8) + "| " + $instanceKey.PadRight(12) + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    $line = "[$timeShort] " + "FAILED".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
                     Write-Host $line -ForegroundColor Red
                 }
 
