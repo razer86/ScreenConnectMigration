@@ -243,7 +243,12 @@ Write-Host ""
 
 try {
     while ($listener.IsListening) {
-        $ctx = $listener.GetContext()
+        # Use async listening to prevent blocking the system and causing sluggishness
+        $task = $listener.GetContextAsync()
+        while (-not $task.AsyncWaitHandle.WaitOne(200)) {
+            # Yields CPU time periodically, keeping the system responsive
+        }
+        $ctx = $task.GetAwaiter().GetResult()
         $req = $ctx.Request
         $res = $ctx.Response
 
@@ -352,12 +357,12 @@ try {
                 # Process the migration
                 $timeShort = $ts.Substring(11, 8)
                 if ($TestMode) {
-                    $line = "[$timeShort] " + "TEST".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    $line = "[$timeShort] " + "TEST".PadRight(8) + "| " + $instanceKey + " | " + $sessionName.PadRight(30) + "| " + $cp[0]
                     Write-Host $line -ForegroundColor Yellow
                     $outObj = @{ ok = $true; action = "test_logged"; sessionId = $sessionId; instance = $instanceKey }
                 }
                 else {
-                    $line = "[$timeShort] " + "SENT".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp[0]
+                    $line = "[$timeShort] " + "SENT".PadRight(8) + "| " + $instanceKey + " | " + $sessionName.PadRight(30) + "| " + $cp[0]
                     Write-Host $line -ForegroundColor Blue
 
                     # Update CP8 on source to mark as migrating
@@ -473,12 +478,12 @@ try {
 
                 if ($success) {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:SUCCESS"
-                    $line = "[$timeShort] " + "SUCCESS".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    $line = "[$timeShort] " + "SUCCESS".PadRight(8) + "| " + $instanceKey + " | " + $sessionName.PadRight(30) + "| " + $cp1.PadRight(20) + "| " + $message
                     Write-Host $line -ForegroundColor Green
                 }
                 else {
                     Sc-SetCustomProperty $scBase $scHeaders $sessionId 7 "MIG:FAILED"
-                    $line = "[$timeShort] " + "FAILED".PadRight(8) + "| " + $instanceKey + "| " + $sessionName.PadRight(18) + "| " + $cp1.PadRight(18) + "| " + $message
+                    $line = "[$timeShort] " + "FAILED".PadRight(8) + "| " + $instanceKey + " | " + $sessionName.PadRight(30) + "| " + $cp1.PadRight(20) + "| " + $message
                     Write-Host $line -ForegroundColor Red
                 }
 
