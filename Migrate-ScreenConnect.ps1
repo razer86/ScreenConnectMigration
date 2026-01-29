@@ -128,10 +128,18 @@ function Sc-SendCommand([string]$scBase, [hashtable]$scHeaders, [string]$Session
 
 function Read-Body([System.Net.HttpListenerRequest]$req) {
     if ($req.ContentLength64 -gt 1048576) { throw "Body too large (max 1MB)" }
-    $sr = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
-    $body = $sr.ReadToEnd()
-    $sr.Close()
-    return $body
+    $sr = $null
+    try {
+        $sr = New-Object System.IO.StreamReader($req.InputStream, $req.ContentEncoding)
+        $body = $sr.ReadToEnd()
+        return $body
+    }
+    catch [System.IO.IOException] {
+        throw "Client disconnected while reading request body"
+    }
+    finally {
+        if ($sr) { $sr.Dispose() }
+    }
 }
 
 function Test-PayloadValid {
@@ -380,13 +388,25 @@ try {
 
 function Send-Result {
     param([bool]`$Success, [string]`$Message)
-    try {
-        `$body = @{ sessionId = `$sessionId; success = `$Success; message = `$Message } | ConvertTo-Json -Compress
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-RestMethod -Uri `$resultUrl -Method POST -Body `$body -ContentType "application/json" -UseBasicParsing | Out-Null
-    } catch {
-        Write-Host "Failed to send result: `$(`$_.Exception.Message)"
+    `$body = @{ sessionId = `$sessionId; success = `$Success; message = `$Message } | ConvertTo-Json -Compress
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    `$maxRetries = 5
+    `$retryDelay = 2
+    for (`$i = 1; `$i -le `$maxRetries; `$i++) {
+        try {
+            Invoke-RestMethod -Uri `$resultUrl -Method POST -Body `$body -ContentType "application/json" -UseBasicParsing | Out-Null
+            Write-Host "Result sent successfully"
+            return
+        } catch {
+            Write-Host "Attempt `$i failed: `$(`$_.Exception.Message)"
+            if (`$i -lt `$maxRetries) {
+                Write-Host "Retrying in `$retryDelay seconds..."
+                Start-Sleep -Seconds `$retryDelay
+                `$retryDelay = `$retryDelay * 2
+            }
+        }
     }
+    Write-Host "Failed to send result after `$maxRetries attempts"
 }
 
 try {
